@@ -83,16 +83,16 @@ cava:
   dist_max_delay: 6
 
   # 🔧 降低损失权重，防止梯度爆炸
-  lambda_align: 0.07         # 从0.05降到0.03
-  lambda_prior: 0.02          # 保持禁用
-  lambda_edge: 0.02          # 从0.005降到0.003
+  lambda_align: 0.05         # 从0.05降到0.03
+  lambda_prior: 0.00         # 保持禁用
+  lambda_edge: 0.01          # 从0.005降到0.003
   inject: pre_fusion     # 让 CAVA 在送入 coattn 前对齐音频
   use_in_coattn: true    # 标记 coattn 路径也要启用 CAVA
   use_infonce: true
-  tau: 0.05                  # 从0.07提高到0.1，减少exp数值问题
+  tau: 0.07                  # 从0.07提高到0.1，减少exp数值问题
 
-  prior_mu: 4.0
-  prior_sigma: 1.0
+  #prior_mu: 4.0
+  #prior_sigma: 1.0
   gate_min: 0.15     # ← 配合上面的门控阈值
   edge_margin_ratio: 0.25
 
@@ -159,17 +159,18 @@ training:
 
   # 半监督配置
   ssl:
+    ema_decay_init: 0.99
     ema_decay: 0.999
-    warmup_epochs: 8
-    final_thresh: 0.85
-    consistency_temp: 0.8
+    warmup_epochs: 5
+    final_thresh: 0.9
+    consistency_temp: 1.0
     lambda_u: 1.0
     use_dist_align: true       # 分布对齐 (ReMixMatch)  :contentReference[oaicite:3]{index=3}
     use_cls_threshold: true    # 类自适应阈值 (FlexMatch 简化)  :contentReference[oaicite:4]{index=4}
     thr_min: 0.05
     cls_thr_momentum: 0.9
     adaptive_thresh: true
-    eval_with_ema: true        # 验证用 EMA 教师  :contentReference[oaicite:5]{index=5}
+    eval_with_ema:  "auto"   # "auto"/"student"/"teacher"      # 验证用 EMA 教师  :contentReference[oaicite:5]{index=5}
 
   # 🔧 新增：数值稳定性配置
   numerical_stability:
