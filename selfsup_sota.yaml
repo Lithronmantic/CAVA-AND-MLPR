@@ -1,0 +1,186 @@
+# selfsup_sota_fixed.yaml
+# 🔧 NaN问题完全修复版 - 解决15个epoch后的数值稳定性问题
+
+seed: 42
+
+data:
+  data_root: none
+  labeled_csv: "./scripts/dataset/train_5p.csv"
+  val_csv: "./scripts/dataset/val_5p.csv"
+  unlabeled_csv: "./scripts/dataset/unlabeled_5p_nolabel.csv"
+  num_classes: 12
+  class_names:
+    - "Good"
+    - "Excessive Convexity"
+    - "Undercut"
+    - "Excessive Penetration"
+    - "Incomplete Penetration"
+    - "Lack of Fusion"
+    - "Overlap"
+    - "Porosity"
+    - "Spatter"
+    - "Arc Strike"
+    - "Crack"
+    - "Burn Through"
+
+  sampler: "weighted"
+  num_workers_train: 4
+  num_workers_val: 2
+  num_workers_unl: 4
+
+video:
+  num_frames: 8
+  size: 224
+  fps: 8
+
+audio:
+  sample_rate: 16000
+  n_fft: 1024
+  hop_length: 256
+  n_mels: 80
+  fmin: 20
+  fmax: 7600
+
+model:
+  video_backbone:
+    name: "resnet18"
+    weights: "imagenet"
+    frozen_stages: 0
+    out_dim: 512
+
+  audio_backbone:
+    name: "light_vggish"
+    weights: "none"
+    frozen_stages: 0
+    out_dim: 128
+
+  fusion:
+    type: "coattn"
+    d_model: 256
+    layers: 2
+    heads: 8
+
+  init_bias: true
+  mil:
+    topk_ratio: 0.15     # 训练期更“挑剔”，降低长尾噪声干扰
+    dropout: 0.3
+    attn_temp: 0.9       # 验证期注意力略尖锐
+  use_aux_heads: true
+
+# ============================================================================
+# CAVA配置 - 降低权重提高稳定性
+# ============================================================================
+cava:
+  enabled: true
+  delta_low_frames: 2.0
+  delta_high_frames: 6.0
+  gate_clip_min: 0.1
+  gate_clip_max: 0.9
+
+  # 分布-类别监督/自监督权重与最大分布时延
+  lambda_causal_sup: 0.0
+  lambda_causal_unsup: 0.0
+  dist_max_delay: 6
+
+  # 🔧 降低损失权重，防止梯度爆炸
+  lambda_align: 0.07         # 从0.05降到0.03
+  lambda_prior: 0.02          # 保持禁用
+  lambda_edge: 0.02          # 从0.005降到0.003
+  inject: pre_fusion     # 让 CAVA 在送入 coattn 前对齐音频
+  use_in_coattn: true    # 标记 coattn 路径也要启用 CAVA
+  use_infonce: true
+  tau: 0.05                  # 从0.07提高到0.1，减少exp数值问题
+
+  prior_mu: 4.0
+  prior_sigma: 1.0
+  gate_min: 0.15     # ← 配合上面的门控阈值
+  edge_margin_ratio: 0.25
+
+  # 🔥 新增：梯度裁剪
+  clip_cava_grad: true    # 在CAVA内部裁剪梯度
+  max_cava_grad: 10.0     # CAVA梯度上限
+
+# ============================================================================
+# MLPR配置 - 大幅降低更新频率
+# ============================================================================
+mlpr:
+  enabled: true
+
+  use_history_stats: true
+  use_cava_signal: true
+  use_prob_vector: false
+
+  weight_clip: [0.05, 0.95]
+
+  # 🔧 更高的EMA衰减
+  ema_decay: 0.9998           # 从0.9998提高到0.9999
+
+  history_momentum: 0.9
+
+  # 🔧 大幅降低元学习参数
+  meta_lr: 1.0e-4             # 从2e-5降到1e-5
+  T: 0.7
+  lambda_u: 0.2
+  ramp_up_epochs: 10
+
+  # 🔧 大幅降低元学习更新频率
+  meta_interval: 50          # 从50增加到100
+  inner_lr: 1.0e-5            # 从2e-5降到1e-5
+
+# ============================================================================
+# 损失函数配置 - 降低Focal系数
+# ============================================================================
+loss:
+  name: "ce"                  #focal_ce
+  gamma: 1.0                  # 从1.5降到1.0，减少极端梯度
+  label_smoothing: 0.0
+  class_weights: null
+
+# ============================================================================
+# 训练配置 - 降低学习率和梯度裁剪
+# ============================================================================
+training:
+  use_ssl: true
+  amp:  false                   # 前15个epoch使用
+  amp_disable_epoch: 15       # 🔧 新增：15个epoch后自动禁用AMP
+
+  batch_size: 16
+  num_epochs: 30
+  early_stop_patience: 6  # 验证长期不升触发早停（trainer里已支持）
+  # 🔧 降低学习率
+  learning_rate: 5e-5       # 从5e-5降到3e-5
+
+  # 🔧 更严格的梯度裁剪
+  gradient_clip: 10         # 从1.0降到0.5
+  grad_clip_norm: 0.5         # 从1.0降到0.5
+
+  backbone_lr_mult: 0.1
+  weight_decay: 1.0e-3
+
+  # 半监督配置
+  ssl:
+    ema_decay: 0.999
+    warmup_epochs: 8
+    final_thresh: 0.85
+    consistency_temp: 0.8
+    lambda_u: 1.0
+    use_dist_align: true       # 分布对齐 (ReMixMatch)  :contentReference[oaicite:3]{index=3}
+    use_cls_threshold: true    # 类自适应阈值 (FlexMatch 简化)  :contentReference[oaicite:4]{index=4}
+    thr_min: 0.05
+    cls_thr_momentum: 0.9
+    adaptive_thresh: true
+    eval_with_ema: true        # 验证用 EMA 教师  :contentReference[oaicite:5]{index=5}
+
+  # 🔧 新增：数值稳定性配置
+  numerical_stability:
+    check_nan: true           # 启用NaN检查
+    nan_recovery: true        # 启用NaN恢复机制
+    gradient_anomaly_detection: true
+    reinit_on_nan: true       # NaN时重新初始化最后一层
+
+# ============================================================================
+# 评估配置
+# ============================================================================
+eval:
+  tune_thresholds: false
+  metrics_topk: 1
