@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 CAVA (Causal Audio-Visual Alignment)
-- 学习延时 Δt（单位：帧），对音频序列做可微分右移，使“声先视后”
-- 输出对齐后的音频序列、门控 g(t)、以及 trainer/可视化所需辅助量
-- 保持与你现有 EnhancedAVTopDetector / strong_trainer 的键名兼容
+- 学习连续延时 Δt（单位：帧），对音频序列做软右移 (linear interpolation)
+- 产生因果门控 g(t) 与相关分布，供损失/可视化/诊断
+- 【保持向后兼容的键名】，并额外输出 delay_frames_cont（与 delay_frames 等价）
 """
 from typing import Dict, Optional
 import torch
@@ -16,27 +16,27 @@ def _clamp01(x: torch.Tensor, a: float, b: float) -> torch.Tensor:
 
 def soft_shift_right(A: torch.Tensor, delta_frames: torch.Tensor) -> torch.Tensor:
     """
-    对 [B,T,D] 的 A 按 Δt 右移（线性插值）。delta_frames: [B] 或标量张量。
+    软右移：对 [B,T,D] 的音频序列 A 按 Δt 右移，Δt 可为 [B] 连续值
     """
     B, T, D = A.shape
     if delta_frames.ndim == 0:
         delta_frames = delta_frames.view(1).expand(B)
     delta = delta_frames.view(B, 1, 1).clamp_min(0.0).clamp_max(max(T - 1, 0))
 
-    n = torch.floor(delta)               # 整数部分
-    alpha = (delta - n).to(A.dtype)      # 小数部分
+    n = torch.floor(delta)                   # 整数部分
+    alpha = (delta - n).to(A.dtype)          # 小数部分
     n = n.long()
 
     t = torch.arange(T, device=A.device).view(1, T, 1)
-    idx0 = torch.clamp(t - n, 0, T - 1)  # t - n
+    idx0 = torch.clamp(t - n, 0, T - 1)      # t - n
     idx1 = torch.clamp(idx0 - 1, 0, T - 1)
 
     A0 = torch.gather(A, 1, idx0.expand(B, T, D))
     A1 = torch.gather(A, 1, idx1.expand(B, T, D))
-    return (1.0 - alpha) * A0 + alpha * A1  # [B,T,D]
+    return (1.0 - alpha) * A0 + alpha * A1
 
 class LearnableDelay(nn.Module):
-    """ Δt = L + (U-L) * sigmoid(theta) """
+    """ Δt = low + (high-low) * sigmoid(theta) """
     def __init__(self, low_frames: float = 2.0, high_frames: float = 6.0, init_mid: bool = True):
         super().__init__()
         self.low = float(low_frames)
@@ -45,14 +45,13 @@ class LearnableDelay(nn.Module):
         self.theta = nn.Parameter(torch.tensor(init, dtype=torch.float32))
 
     def forward(self, B: int) -> torch.Tensor:
-        # 关闭 autocast，保证 Δt 的数值稳定
         with torch.amp.autocast('cuda', enabled=False):
             theta = torch.clamp(self.theta, -10.0, 10.0)
             delta = self.low + (self.high - self.low) * torch.sigmoid(theta)
             return delta.expand(B)  # 连续值
 
 class CausalGate(nn.Module):
-    """ 输入 concat([A_shift, V, A_shift*V]) → g∈(0,1) """
+    """ concat([A_shift, V, A_shift*V]) → g∈(0,1) """
     def __init__(self, d_model: int, hidden: int = 2048, clip_min: float = 0.05, clip_max: float = 0.95):
         super().__init__()
         hidden = min(hidden, d_model * 4)
@@ -83,8 +82,7 @@ class CAVAModule(nn.Module):
     """
     - 把 A,V 投到同一维 d_model
     - 学 Δt(帧)，对 A 做软右移
-    - 产生因果门控 g（供损失&可视化；不直接混模态，交给后续融合）
-    - 输出: 对齐后的 audio 序列，以及 Δt/g/相关分布等辅助量
+    - 输出：audio_aligned、causal_gate、delay_frames(连续)、以及相关分布和诊断量
     """
     def __init__(self, video_dim: int, audio_dim: int, d_model: int = 256,
                  delta_low_frames: float = 2.0, delta_high_frames: float = 6.0,
@@ -112,12 +110,11 @@ class CAVAModule(nn.Module):
             nn.init.zeros_(self.a_proj.bias)
 
     def _corr_scores(self, A: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-        """计算各时延的整体相关性得分 (B, 2*md+1)"""
         if A.dim() == 2: A = A.unsqueeze(1)
         if V.dim() == 2: V = V.unsqueeze(1)
         B, Ta, Da = A.shape
         Bv, Tv, Dv = V.shape
-        assert B == Bv, "Batch size mismatch"
+        assert B == Bv
         T = min(Ta, Tv)
         A = A[:, :T, :]
         V = V[:, :T, :]
@@ -135,7 +132,6 @@ class CAVAModule(nn.Module):
         return torch.stack(scores, dim=1)  # [B, 2*md+1]
 
     def get_predicted_delay(self, audio_seq: torch.Tensor, video_seq: torch.Tensor) -> torch.Tensor:
-        """基于相关分布取 argmax - md 作为最可能Δt（整数帧，仅用于诊断）"""
         scores = self._corr_scores(audio_seq, video_seq)
         prob = F.softmax(scores, dim=1)
         md = int(self.dist_max_delay)
@@ -151,7 +147,6 @@ class CAVAModule(nn.Module):
             a_shift = soft_shift_right(a, delta)  # [B,T,D]
             g = self.gate(v, a_shift)             # [B,T,1]
 
-            # 相关分布与离散预测（基于未对齐的 a 与 v）
             scores = self._corr_scores(a, v)
             prob = F.softmax(scores, dim=1)       # [B, 2*md+1]
             md = int(self.dist_max_delay)
@@ -162,13 +157,13 @@ class CAVAModule(nn.Module):
                 "audio_aligned": a_shift,
                 "audio_proj": a,
                 "video_proj": v,
-                "audio_seq": a,                    # 便于上游诊断
+                "audio_seq": a,
                 "causal_gate": g,
-                "delay_frames": delta,             # 连续 Δt
-                "delay_frames_cont": delta,        # 同义键，向后兼容
+                "delay_frames": delta,            # 连续 Δt
+                "delay_frames_cont": delta,       # 同义键
                 "delta_low": float(self.delta_low.item()),
                 "delta_high": float(self.delta_high.item()),
-                "causal_prob": g.squeeze(-1),      # 便于直接画热力图
+                "causal_prob": g.squeeze(-1),
                 "causal_prob_dist": prob,
                 "pred_delay": pred_delay
             }
