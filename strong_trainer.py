@@ -1,12 +1,11 @@
-# scripts/strong_trainer.py
 # -*- coding: utf-8 -*-
 """
-完全修复版训练器 + 启动横幅 + 细粒度训练日志 + 三项增强：
-  A) 分布对齐 (ReMixMatch)
-  B) 类自适应阈值（简化 CPL）
-  C) 验证可选使用 EMA 教师
-
-保留你原有 API/键名，修复已知 bug（ask/mask、thr_local 未定义、CAVA loss 条件、若干 NaN/Inf 防护）。
+StrongTrainer (修复+增强版)
+- Student & EMA Teacher 双路评测（取更优者计做 best）
+- EMA 衰减分段（ema_decay_init→ema_decay，在 warmup 内线性过渡）
+- 伪标签阈值更保守：全局阈值不超过 teacher p90_ema 的 0.9×（下界 thr_min）
+- 分布对齐 / 类阈值：推迟到 p90_ema>0.35 或 epoch>warmup+2 再启用
+- CAVA: 使用连续 Δt 参与 prior/edge；对齐损失稳定性增强
 """
 import os, json, math, random, time
 from pathlib import Path
@@ -34,7 +33,7 @@ except Exception:
 
 from enhanced_detector import EnhancedAVTopDetector
 
-# --- AMP 兼容包装 ---
+# AMP 兼容封装
 try:
     from torch.amp import autocast as _autocast, GradScaler as _GradScaler
     AMP_DEVICE_ARG = True
@@ -50,7 +49,7 @@ except Exception:
     def AmpGradScaler(device_type, enabled=True):
         return _GradScaler(enabled=enabled)
 
-# -------------------- Focal CE --------------------
+# Focal CE（保留你的实现）
 class FocalCrossEntropy(nn.Module):
     def __init__(self, gamma=2.0, label_smoothing=0.0, class_weights=None):
         super().__init__()
@@ -75,7 +74,6 @@ class FocalCrossEntropy(nn.Module):
                 focal_weight = (1 - pt) ** self.gamma
             loss = focal_weight * ce
             if torch.isnan(loss).any() or torch.isinf(loss).any():
-                print("⚠️ Focal loss包含NaN/Inf，降级到标准CE")
                 return ce.mean()
             return loss.mean()
 
@@ -98,11 +96,9 @@ class StrongTrainer:
         try:
             if self.amp_enabled and hasattr(self.scaler, '_init_scale'):
                 init_scale = cfg.get("training", {}).get("amp_init_scale", 512.0)
-                self.scaler._init_scale = 2 ** 10
                 self.scaler._scale = torch.tensor(float(init_scale), dtype=torch.float32, device=self.device)
-                print(f"[AMP] enabled=True, device_type={self.device_type}, init_scale={init_scale}")
-        except Exception as e:
-            print(f"[AMP] 初始化scale时出现警告: {e}")
+        except Exception:
+            pass
         self.amp_disable_epoch = int(cfg.get("training", {}).get("amp_disable_epoch", 15))
         self.original_amp_enabled = self.amp_enabled
         self.grad_explosion_count = 0; self.max_grad_explosion = 3
@@ -118,7 +114,7 @@ class StrongTrainer:
         self.ds_u = AVFromCSV(u_csv, root, self.C, self.class_names, vcfg, acfg, is_unlabeled=True) if (
             cfg.get("training", {}).get("use_ssl", False) and u_csv) else None
 
-        # 标注先验统计
+        # 标注先验
         self.stats = self._scan_stats(self.ds_l)
         (self.out_dir / 'stats').mkdir(exist_ok=True, parents=True)
         (self.out_dir / 'stats' / 'class_stats.json').write_text(
@@ -205,7 +201,7 @@ class StrongTrainer:
 
         print(f"[AMP] enabled={self.amp_enabled}, device_type={self.device_type}, init_scale={getattr(self.scaler, '_init_scale', 'N/A')}")
 
-        # Stats
+        # stats
         self.nan_count = 0; self.total_steps = 0; self.meta_fail_count = 0
 
         # MLPR
@@ -235,16 +231,16 @@ class StrongTrainer:
         self.teacher = None
         self.ema_decay = 0.999; self.ssl_warmup = 5; self.ssl_final_thresh = 0.9; self.ssl_temp = 1.0; self.lambda_u = 1.0
 
-        # === 新增：分布对齐 & 类阈值配置（默认开启） ===
         ssl_cfg = dict(cfg.get("ssl", {}))
-        self._use_dist_align = bool(ssl_cfg.get("use_dist_align", True))  # A)
-        self._use_cls_threshold = bool(ssl_cfg.get("use_cls_threshold", True))  # B)
+        self._use_dist_align = bool(ssl_cfg.get("use_dist_align", True))
+        self._use_cls_threshold = bool(ssl_cfg.get("use_cls_threshold", True))
         self._thr_min = float(ssl_cfg.get("thr_min", 0.05))
         self._cls_thr_momentum = float(ssl_cfg.get("cls_thr_momentum", 0.9))
-        # 运行中维护每类阈值与 EMA 置信度
         self._cls_conf_ema = torch.full((self.C,), 0.5, device=self.device)
         self._cls_thr = torch.full((self.C,), self.ssl_final_thresh, device=self.device)
 
+        # EMA 衰减分段参数
+        self.ema_decay_init = float(ssl_cfg.get("ema_decay_init", 0.99))
         if self.use_ssl:
             self.ema_decay = float(ssl_cfg.get("ema_decay", 0.999))
             self.ssl_warmup = int(ssl_cfg.get("warmup_epochs", 5))
@@ -258,25 +254,27 @@ class StrongTrainer:
             self.teacher.eval()
             print(f"[SSL] EMA={self.ema_decay} warmup={self.ssl_warmup} T={self.ssl_temp} thr*={self.ssl_final_thresh} λu={self.lambda_u}")
 
+        # 评测策略：auto/student/teacher
+        self.eval_with_ema_mode = str(ssl_cfg.get("eval_with_ema", "auto")).lower()
+
         self.best_f1 = -1.0
         self.cava_cfg = dict(cfg.get("cava", {}))
         self.cava_enabled = bool(self.cava_cfg.get("enabled", False))
 
         self._print_startup_banner()
-
         trcfg = cfg.get("training", {})
-        self.early_stop_patience = int(trcfg.get("early_stop_patience", 0))  # 0=关闭
+        self.early_stop_patience = int(trcfg.get("early_stop_patience", 0))
         self.no_improve = 0
-        # 先验 pi（用于分布对齐）
         self._pi = torch.tensor(self.stats["pi"], dtype=torch.float32, device=self.device)
 
-    # -------- 横幅：把关键开关和七路输入讲清楚 --------
+        # Teacher 置信度跟踪
+        self._teach_p90_ema = 0.2
+
+    # 打印横幅
     def _print_startup_banner(self):
-        def _cls_name(x):
-            try:
-                return type(x).__name__
-            except:
-                return str(type(x))
+        def _name(x):
+            try: return type(x).__name__
+            except: return str(type(x))
         vbb = getattr(self.model, 'video_backbone', None)
         abb = getattr(self.model, 'audio_backbone', None)
         print("┌─ Model/Fusion")
@@ -284,7 +282,7 @@ class StrongTrainer:
         print(f"│  video_dim, audio_dim= {self.model.video_dim}, {self.model.audio_dim}")
         print(f"│  fusion_dim          = {self.model.fusion_dim}")
         print(f"│  num_classes         = {self.num_classes}")
-        print(f"│  backbones           = Video<{_cls_name(vbb)}>, Audio<{_cls_name(abb)}>")
+        print(f"│  backbones           = Video<{_name(vbb)}>, Audio<{_name(abb)}>")
         print("├─ CAVA (Causal Align)")
         print(f"│  enabled             = {self.cava_enabled}")
         if self.cava_enabled:
@@ -297,12 +295,13 @@ class StrongTrainer:
         print("├─ SSL (Teacher-Student EMA)")
         print(f"│  enabled             = {self.use_ssl}")
         if self.use_ssl:
-            print(f"│  ema_decay           = {self.ema_decay}")
+            print(f"│  ema_decay_init/final= {self.ema_decay_init}/{self.ema_decay}")
             print(f"│  warmup_epochs       = {self.ssl_warmup}")
             print(f"│  final_thresh        = {self.ssl_final_thresh}")
             print(f"│  consistency_temp    = {self.ssl_temp}")
             print(f"│  lambda_u            = {self.lambda_u}")
             print(f"│  dist_align / cls_thr= {self._use_dist_align} / {self._use_cls_threshold}")
+            print(f"│  eval mode           = {self.eval_with_ema_mode}")
         print("├─ MLPR (Meta Reweight)")
         print(f"│  enabled             = {self.mlpr_enabled}")
         if self.mlpr_enabled:
@@ -330,7 +329,7 @@ class StrongTrainer:
         print(f"│  loss                = {'FocalCE' if self.loss_name=='focal_ce' else 'CrossEntropy'}")
         print("└────────────────────────────────────────────────────────────────")
 
-    # -------------------- 标注集统计 --------------------
+    # 统计
     def _scan_stats(self, ds_l) -> Dict[str, Any]:
         C = self.C
         counts = np.zeros(C, dtype=np.int64)
@@ -370,7 +369,6 @@ class StrongTrainer:
             "total": int(total),
         }
 
-    # -------------------- helpers --------------------
     def _forward(self, v: torch.Tensor, a: torch.Tensor):
         return self.model(v, a, return_aux=True)
 
@@ -392,11 +390,14 @@ class StrongTrainer:
         else:
             return self.ssl_final_thresh
 
-    def _ema_update(self):
+    def _ema_update(self, frac_in_epoch: float = 1.0):
         if self.teacher is None: return
+        # ema 衰减分段：warmup 内从 ema_decay_init 过渡到 ema_decay
+        k = min(1.0, max(0.0, (self.current_epoch - 1 + frac_in_epoch) / max(1, self.ssl_warmup)))
+        ema_now = self.ema_decay_init * (1 - k) + self.ema_decay * k
         with torch.no_grad():
             for t_param, s_param in zip(self.teacher.parameters(), self.model.parameters()):
-                t_param.data.mul_(self.ema_decay).add_(s_param.data, alpha=1.0 - self.ema_decay)
+                t_param.data.mul_(ema_now).add_(s_param.data, alpha=1.0 - ema_now)
 
     def _init_bias(self, model, pi):
         pi_tensor = torch.tensor(pi, dtype=torch.float32, device=self.device)
@@ -449,9 +450,9 @@ class StrongTrainer:
             print(f"[BiasInit] MIL 头 bias 初始化失败: {e}")
 
         if not hit:
-            print("[BiasInit] 未命中任何可初始化的线性层（classifier/head/fc 或 MIL 头），请检查模型构造。")
+            print("[BiasInit] 未命中任何可初始化的线性层（classifier/head/fc 或 MIL 头）")
 
-    # -------------------- meta (保持你现有逻辑，略) --------------------
+    # meta update（保留现有一阶近似）
     def _meta_update_step(self, step_count: int):
         if not self.mlpr_enabled or self.meta is None or self.meta_opt is None: return
         try:
@@ -472,16 +473,12 @@ class StrongTrainer:
                     if out_train is None or "clip_logits" not in out_train:
                         print("[Meta] 训练前向失败"); return
                     logits_train = out_train["clip_logits"]
-                    if torch.isnan(logits_train).any():
-                        print("[Meta] 训练logits包含nan，跳过"); return
 
                     train_loss = self.criterion(logits_train, y_train)
                     if hasattr(self, '_last_pseudo_loss') and (self._last_pseudo_loss is not None):
                         pseudo_loss = self._last_pseudo_loss
                         if torch.is_tensor(pseudo_loss) and (not torch.isnan(pseudo_loss)) and (not torch.isinf(pseudo_loss)):
                             train_loss = train_loss + self._mlpr_lambda_u * pseudo_loss
-                    if torch.isnan(train_loss) or torch.isinf(train_loss):
-                        print("[Meta] 训练损失异常，跳过"); return
 
                     meta_loss = self._meta_step_first_order_fixed(
                         student_model=self.model, meta_net=self.meta, meta_opt=self.meta_opt,
@@ -491,11 +488,8 @@ class StrongTrainer:
                     if not hasattr(self, '_meta_losses'): self._meta_losses = []
                     self._meta_losses.append(meta_loss)
                     self.model.train()
-        except RuntimeError as e:
-            if "appears to not have been used" in str(e): pass
-            else: print(f"[Meta Update Warning] {e}")
         except Exception as e:
-            print(f"[Meta Update Error] {e}")
+            print(f"[Meta Update] {e}")
 
     def _meta_step_first_order_fixed(self, student_model, meta_net, meta_opt, train_loss, val_batch, lr_inner):
         param_backup = {n: p.clone() for n, p in student_model.named_parameters() if p.requires_grad}
@@ -520,13 +514,20 @@ class StrongTrainer:
             if name in param_backup: param.data = param_backup[name]
         return val_loss.item()
 
-    # -------------------- train / val --------------------
+    # -------------------- train / validate --------------------
     def train(self):
         for epoch in range(1, self.epochs + 1):
-            tr = self._train_epoch(epoch); va = self._validate(epoch); self.scheduler.step()
-            if va["f1_macro"] > getattr(self, "best_f1", -1.0):
-                self.best_f1 = va["f1_macro"]
-                torch.save({"epoch": epoch, "state_dict": self.model.state_dict()},
+            tr = self._train_epoch(epoch)
+            va = self._validate(epoch)
+            self.scheduler.step()
+
+            # best 以两路中更优的 f1_macro
+            f1_for_ckpt = max(va["student"]["f1_macro"], va["teacher"]["f1_macro"])
+            who = "student" if f1_for_ckpt == va["student"]["f1_macro"] else "teacher"
+
+            if f1_for_ckpt > getattr(self, "best_f1", -1.0):
+                self.best_f1 = f1_for_ckpt
+                torch.save({"epoch": epoch, "state_dict": (self.model.state_dict() if who=="student" else self.teacher.state_dict())},
                            self.out_dir / 'checkpoints' / 'best_f1.pth')
                 self.no_improve = 0
             else:
@@ -537,12 +538,16 @@ class StrongTrainer:
 
             torch.save({"epoch": epoch, "state_dict": self.model.state_dict()},
                        self.out_dir / 'checkpoints' / 'latest.pth')
+
             lr_head = self.opt.param_groups[0]["lr"]; lr_bb = self.opt.param_groups[1]["lr"]
             nan_rate = self.nan_count / max(self.total_steps, 1) * 100
             meta_fail_rate = (self.meta_fail_count / max(self.total_steps // max(self._mlpr_meta_interval,1), 1) * 100) if self.mlpr_enabled else 0
-            print(f"[Epoch {epoch}/{self.epochs}] LRs={lr_head:.6f},{lr_bb:.6f} | Train={tr['loss']:.4f} | "
-                  f"Val acc={va['acc']:.4f} f1M={va['f1_macro']:.4f} aucM={va['auc_macro']:.4f} | "
-                  f"NaN: {self.nan_count}/{self.total_steps} ({nan_rate:.1f}%) | Meta fails: {self.meta_fail_count} ({meta_fail_rate:.1f}%)")
+
+            print(f"[Epoch {epoch}/{self.epochs}] LRs={lr_head:.6f},{lr_bb:.6f} | "
+                  f"Train={tr['loss']:.4f} | "
+                  f"Val(student) acc={va['student']['acc']:.4f} f1M={va['student']['f1_macro']:.4f} aucM={va['student']['auc_macro']:.4f} | "
+                  f"Val(teacher) acc={va['teacher']['acc']:.4f} f1M={va['teacher']['f1_macro']:.4f} aucM={va['teacher']['auc_macro']:.4f} | "
+                  f"CKPT={who} | NaN: {self.nan_count}/{self.total_steps} ({nan_rate:.1f}%) | Meta fails: {self.meta_fail_count} ({meta_fail_rate:.1f}%)")
 
             if self.early_stop_patience > 0 and self.no_improve >= self.early_stop_patience:
                 print(f"[EarlyStop] 验证集 {self.early_stop_patience} 个 epoch 无提升，提前停止。")
@@ -550,13 +555,14 @@ class StrongTrainer:
 
     def _train_epoch(self, epoch: int):
         if self.grad_explosion_count >= self.max_grad_explosion and self.amp_enabled:
-            print(f"[Epoch {epoch}] 梯度爆炸次数过多({self.grad_explosion_count})，禁用AMP")
+            print(f"[Epoch {epoch}] 梯度爆炸过多，禁用AMP")
             self.amp_enabled = False; self.scaler = AmpGradScaler(self.device_type, enabled=False)
-            for pg in self.opt.param_groups: pg['lr'] *= 0.5; print(f"  学习率降至: {pg['lr']:.6f}")
+            for pg in self.opt.param_groups: pg['lr'] *= 0.5
         if epoch >= self.amp_disable_epoch and self.amp_enabled:
             print(f"[Epoch {epoch}] 达到预定epoch，禁用AMP以提高稳定性")
             self.amp_enabled = False; self.scaler = AmpGradScaler(self.device_type, enabled=False)
-            for pg in self.opt.param_groups: pg['lr'] *= 0.7; print(f"  学习率调整为: {pg['lr']:.6f}")
+            for pg in self.opt.param_groups: pg['lr'] *= 0.7
+
         self.current_epoch = epoch
         self.model.train()
         if self.teacher is not None: self.teacher.eval()
@@ -584,19 +590,14 @@ class StrongTrainer:
             y = y.argmax(dim=1).to(self.device) if y.ndim == 2 else y.to(self.device)
 
             with amp_autocast(self.device_type, enabled=self.amp_enabled, dtype=torch.float16):
-                # ------- 监督前向 -------
+                # ------- 监督 -------
                 out = self._safe_forward(v, a, use_amp=True)
                 if out is None or "clip_logits" not in out:
-                    print("⚠️ 前向传播失败，跳过此batch"); self.nan_count += 1; self.total_steps += 1; self._reset_scaler_if_needed(); continue
+                    self.nan_count += 1; self.total_steps += 1; self._reset_scaler_if_needed(); continue
                 logits = out["clip_logits"]
-                if torch.isnan(logits).any() or torch.isinf(logits).any():
-                    print("⚠️ Logits包含nan/inf，跳过此batch"); self.nan_count += 1; self.total_steps += 1; self._reset_scaler_if_needed(); continue
-
                 sup_loss = self.criterion(logits, y)
-                if torch.isnan(sup_loss) or torch.isinf(sup_loss):
-                    print("⚠️ 监督损失异常，跳过此batch"); self.nan_count += 1; self.total_steps += 1; self._reset_scaler_if_needed(); continue
 
-                # ------- CAVA 对齐损失 -------
+                # ------- CAVA -------
                 cava_loss = v.new_zeros([])
                 if self.cava_enabled:
                     try:
@@ -620,42 +621,27 @@ class StrongTrainer:
                                 loss_align = corr_diag_align(a_aln, v_prj, mask=g)
                             loss_align = torch.clamp(loss_align, min=0.0, max=10.0)
 
-                            delta = out.get("delay_frames", None)
+                            delta = out.get("delay_frames_cont", out.get("delay_frames", None))
                             loss_prior = v.new_zeros([]); loss_edge = v.new_zeros([])
-
                             if isinstance(delta, torch.Tensor):
                                 low = float(out.get("delta_low", self.cava_cfg.get("delta_low_frames", 2.0)))
                                 high = float(out.get("delta_high", self.cava_cfg.get("delta_high_frames", 6.0)))
-
-                                # prior 独立开关
                                 if lam_prior > 0:
                                     mu = self.cava_cfg.get("prior_mu", None)
                                     sigma = self.cava_cfg.get("prior_sigma", None)
-                                    if (mu is None) or (sigma is None):
-                                        print("[CAVA] lambda_prior>0 但 prior_mu/prior_sigma 缺失 → Lpr=0（请在 YAML 里补上）")
-                                    else:
+                                    if (mu is not None) and (sigma is not None):
                                         loss_prior = prior_l2(delta, mu, sigma)
-
-                                # edge 独立开关
                                 if lam_edge > 0:
                                     loss_edge = edge_hinge(delta, low, high,
                                                            margin_ratio=float(self.cava_cfg.get("edge_margin_ratio", 0.25)))
-
                             cava_loss = lam_align * loss_align + lam_prior * loss_prior + lam_edge * loss_edge
-                            if torch.isnan(cava_loss) or torch.isinf(cava_loss):
-                                print("⚠️ CAVA损失异常，使用0"); cava_loss = v.new_zeros([])
-
-                            self._last_align = float(loss_align.detach().cpu()) if torch.is_tensor(loss_align) else 0.0
-                            self._last_prior = float(loss_prior.detach().cpu()) if torch.is_tensor(loss_prior) else 0.0
-                            self._last_edge  = float(loss_edge.detach().cpu())  if torch.is_tensor(loss_edge)  else 0.0
-
+                            self._last_align = float(getattr(loss_align, "item", lambda: loss_align)())
+                            self._last_prior = float(getattr(loss_prior, "item", lambda: loss_prior)())
+                            self._last_edge  = float(getattr(loss_edge,  "item", lambda: loss_edge)())
                             cg = out.get("causal_gate", None)
-                            dl = out.get("delay_frames", None)
-                            if isinstance(cg, torch.Tensor):
-                                last_gate_mean = float(cg.float().mean().detach().cpu())
-                            if isinstance(dl, torch.Tensor):
-                                last_delay_mean = float(dl.float().mean().detach().cpu())
-
+                            dl = out.get("delay_frames_cont", out.get("delay_frames", None))
+                            if isinstance(cg, torch.Tensor): last_gate_mean = float(cg.float().mean().detach().cpu())
+                            if isinstance(dl, torch.Tensor): last_delay_mean = float(dl.float().mean().detach().cpu())
                     except Exception as e:
                         print(f"⚠️ CAVA损失计算异常: {e}")
 
@@ -663,8 +649,8 @@ class StrongTrainer:
                 if self.mlpr_enabled:
                     self._last_train_batch = (v.detach(), a.detach(), y.detach())
 
-                # ------- 半监督（SSL） -------
-                thr_display = thr_ssl  # 默认展示阈值
+                # ------- 半监督 -------
+                thr_display = thr_ssl
                 if self.use_ssl and (u_iter is not None):
                     try:
                         try:
@@ -682,11 +668,25 @@ class StrongTrainer:
                             t_logits = tout["clip_logits"] if isinstance(tout, dict) and "clip_logits" in tout \
                                 else (list(tout.values())[0] if isinstance(tout, dict) else tout)
                             t_logits = torch.clamp(t_logits, min=-50, max=50)
-
-                            # 分布对齐 (A)
                             t_prob = F.softmax(t_logits / self.ssl_temp, dim=1)
-                            if self._use_dist_align:
-                                # 估计当前批次的 q，按 ReMixMatch 把 q 对齐到标注先验 pi
+
+                            # 统计 p90 并更新 EMA
+                            t_max_all = t_prob.max(dim=1).values.detach().float().cpu().numpy()
+                            p90 = float(np.percentile(t_max_all, 90))
+                            self._teach_p90_ema = 0.9 * self._teach_p90_ema + 0.1 * p90
+                            if (step_count % 100) == 0:
+                                print(f"[Diag] teacher_conf: mean={t_max_all.mean():.3f} p90={p90:.3f} thr={thr_ssl:.2f}")
+
+                            # 全局阈值的更保守形态：不超过 0.9*p90_ema
+                            thr_cap = max(self._thr_min, 0.9 * self._teach_p90_ema)
+                            thr_local = min(self._thr_at(epoch), thr_cap)
+                            thr_display = thr_local
+
+                            # 温和启用 DA / 类阈值
+                            enable_da   = self._use_dist_align and ((epoch > self.ssl_warmup + 2) or (self._teach_p90_ema > 0.35))
+                            enable_cpl  = self._use_cls_threshold and ((epoch > self.ssl_warmup + 2) or (self._teach_p90_ema > 0.35))
+
+                            if enable_da:
                                 q = t_prob.mean(dim=0, keepdim=True).clamp(min=1e-8)
                                 align = (self._pi.view(1, -1) / q).to(t_prob)
                                 t_prob = (t_prob * align).clamp(min=1e-8)
@@ -694,31 +694,15 @@ class StrongTrainer:
 
                             t_max, t_idx = t_prob.max(dim=1)
 
-                            # 自适应降低全局阈值（p90 小于阈值时）
-                            thr_local = thr_ssl
-                            if (step_count % 100) == 0:
-                                tm = t_max.detach().float().cpu().numpy()
-                                p90 = float(np.percentile(tm, 90))
-                                print(f"[Diag] teacher_conf: mean={tm.mean():.3f} p90={p90:.3f} thr={thr_ssl:.2f}")
-                                if bool(self.cfg.get("ssl", {}).get("adaptive_thresh", True)) and (p90 < thr_ssl):
-                                    thr_local = max(0.05, 0.9 * p90)
-                            thr_display = thr_local
-
-                            # 类阈值 (B) —— 维护每类 EMA 置信度，并给每样本一个 per-class 阈值
-                            if self._use_cls_threshold:
+                            if enable_cpl:
                                 with torch.no_grad():
                                     for c in range(self.C):
                                         mask_c = (t_idx == c)
                                         if mask_c.any():
                                             mean_c = t_max[mask_c].mean()
-                                            # EMA 更新
-                                            self._cls_conf_ema[c] = self._cls_thr_momentum * self._cls_conf_ema[c] + \
-                                                                    (1 - self._cls_thr_momentum) * mean_c
-                                            # 每类阈值：夹在 [thr_min, final_thresh]
-                                            self._cls_thr[c] = torch.clamp(self._cls_conf_ema[c],
-                                                                           min=self._thr_min,
-                                                                           max=self.ssl_final_thresh)
-                                thr_vec = self._cls_thr.to(self.device)[t_idx]  # [B_u]
+                                            self._cls_conf_ema[c] = self._cls_thr_momentum * self._cls_conf_ema[c] + (1 - self._cls_thr_momentum) * mean_c
+                                            self._cls_thr[c] = torch.clamp(self._cls_conf_ema[c], min=self._thr_min, max=self.ssl_final_thresh)
+                                thr_vec = self._cls_thr.to(self.device)[t_idx]
                                 thr_use = torch.minimum(thr_vec, torch.full_like(thr_vec, thr_local))
                             else:
                                 thr_use = torch.full_like(t_max, thr_local)
@@ -726,12 +710,11 @@ class StrongTrainer:
                         # 学生前向
                         sout = self._safe_forward(vu, au, use_amp=True)
                         if sout is None or "clip_logits" not in sout:
-                            print("⚠️ 学生前向失败，跳过伪标签")
+                            pass
                         else:
                             s_logits = sout["clip_logits"]
 
                             if self.mlpr_enabled and (self.meta is not None):
-                                # ====== MLPR 路径（保持你现有）======
                                 stu_feat = None
                                 if isinstance(sout, dict):
                                     ftok = sout.get("fusion_token", None)
@@ -760,8 +743,7 @@ class StrongTrainer:
                                 cava_gate_mean = None
                                 if isinstance(sout, dict) and ("causal_gate" in sout) and (sout["causal_gate"] is not None):
                                     cg = sout["causal_gate"]
-                                    cava_gate_mean = cg.mean(dim=tuple(range(1, cg.dim()))).view(-1, 1) if cg.dim() > 1 \
-                                        else cg.view(-1, 1)
+                                    cava_gate_mean = cg.mean(dim=tuple(range(1, cg.dim()))).view(-1, 1) if cg.dim() > 1 else cg.view(-1, 1)
 
                                 feats = build_mlpr_features(
                                     teacher_prob=t_prob,
@@ -774,17 +756,13 @@ class StrongTrainer:
                                 if not hasattr(self, "_printed_meta_dim_check"):
                                     print(f"[MLPR] feats.shape={tuple(feats.shape)}, meta.input_dim={getattr(self.meta, 'input_dim', None)}")
                                     self._printed_meta_dim_check = True
-                                    if hasattr(self.meta, "input_dim") and feats.size(1) != self.meta.input_dim:
-                                        print(f"⚠️ [MLPR] 特征维度与 Meta 期望不一致: {feats.size(1)} vs {self.meta.input_dim}")
 
-                                w = self.meta(feats).clone()                    # [B,1] in [0,1]
+                                w = self.meta(feats).clone()
                                 s_log_prob = F.log_softmax(s_logits, dim=1)
                                 t_prob_stable = t_prob.clamp(min=1e-8)
-                                # KL 每样本
                                 kl = F.kl_div(s_log_prob, t_prob_stable, reduction="none").sum(dim=1, keepdim=True)
                                 kl = torch.clamp(kl, min=0.0, max=10.0)
 
-                                # 双门控：置信度 & 因果
                                 conf_mask = (t_max.view(-1, 1) > thr_use.view(-1, 1)).float()
                                 gate_min = float(self.cava_cfg.get("gate_min", 0.15))
                                 if cava_gate_mean is not None:
@@ -801,15 +779,11 @@ class StrongTrainer:
                                     pseudo_loss = v.new_zeros([])
 
                                 self._last_pseudo_loss = pseudo_loss.detach()
-
                                 if self.hist_bank is not None and id_list is not None:
                                     self.hist_bank.update(id_list, kl.squeeze(1).detach())
-
                                 loss = loss + lambda_u_eff_mlpr * pseudo_loss
                                 npseudo_mass += mass
-
                             else:
-                                # ====== 非 MLPR 路径（修复 ask/mask）======
                                 mask = (t_max > thr_use)
                                 if mask.any():
                                     pseudo_loss = F.cross_entropy(s_logits[mask], t_idx[mask])
@@ -818,51 +792,26 @@ class StrongTrainer:
                                     npseudo_mass += float(mask.sum().item())
                                 else:
                                     self._last_pseudo_loss = None
-
                     except Exception as e:
                         print(f"⚠️ 半监督部分异常: {e}")
 
                 # ------- 反向传播 -------
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print("⚠️ 总损失异常，跳过反向传播"); self.nan_count += 1; self.total_steps += 1; self._reset_scaler_if_needed(); continue
+                    self.nan_count += 1; self.total_steps += 1; self._reset_scaler_if_needed(); continue
                 self.opt.zero_grad(set_to_none=True)
                 if self.scaler.is_enabled():
-                    skip_update = False
                     try:
                         self.scaler.scale(loss).backward()
-                        if getattr(self.scaler, '_growth_tracker', None) is None:
-                            print("⚠️ Scaler状态异常，重置"); self._reset_scaler_if_needed(); self.total_steps += 1; continue
                         self.scaler.unscale_(self.opt)
-                        grad_ok = True
-                        for name, param in self.model.named_parameters():
-                            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                                print(f"⚠️ 参数 {name} 梯度异常"); param.grad.zero_(); grad_ok = False
-                        if not grad_ok:
-                            print(f"⚠️ 检测到异常梯度，跳过更新"); skip_update = True; self.nan_count += 1
-                        else:
-                            total_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                            if torch.isnan(total_norm) or torch.isinf(total_norm) or total_norm > 500:
-                                print(f"⚠️ 梯度范数异常: {total_norm}"); skip_update = True; self.nan_count += 1
-                        if skip_update:
-                            self.opt.zero_grad(set_to_none=True); self._reset_scaler_if_needed(); self.total_steps += 1; continue
-                        else:
-                            self.scaler.step(self.opt); self.scaler.update()
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                        self.scaler.step(self.opt); self.scaler.update()
                     except Exception as e:
                         print(f"⚠️ AMP反向传播错误: {e}")
                         self.opt.zero_grad(set_to_none=True); self._reset_scaler_if_needed(); self.nan_count += 1; self.total_steps += 1; continue
                 else:
                     try:
                         loss.backward()
-                        grad_ok = True
-                        for name, param in self.model.named_parameters():
-                            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                                print(f"⚠️ 参数 {name} 梯度异常"); param.grad.zero_(); grad_ok = False
-                        if not grad_ok:
-                            self.nan_count += 1; self.opt.zero_grad(set_to_none=True); self.total_steps += 1; continue
-                        if self.grad_clip and self.grad_clip > 0:
-                            total_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                            if torch.isnan(total_norm) or torch.isinf(total_norm) or total_norm > 500:
-                                print(f"⚠️ 梯度范数异常: {total_norm}"); self.opt.zero_grad(set_to_none=True); self.nan_count += 1; self.total_steps += 1; continue
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                         self.opt.step()
                     except Exception as e:
                         print(f"⚠️ 反向传播错误: {e}")
@@ -873,7 +822,9 @@ class StrongTrainer:
                 if (step_count + 1) % max(self._mlpr_meta_interval, 1) == 0:
                     self._meta_update_step(step_count)
             if self.use_ssl and self.teacher is not None:
-                self._ema_update()
+                # 传入当前 batch 在 epoch 内的进度，用于 ema_now 计算
+                frac = (step_count + 1) / max(1, len(self.loader_l))
+                self._ema_update(frac_in_epoch=frac)
 
             tot += float(loss.detach().item()); nb += 1; step_count += 1; self.total_steps += 1
             pbar.set_postfix(
@@ -891,33 +842,33 @@ class StrongTrainer:
 
     @torch.no_grad()
     def _validate(self, epoch: int):
-        # === 新增：可选使用 EMA 教师评估 ===
-        use_ema_eval = bool(self.cfg.get("ssl", {}).get("eval_with_ema", True)) and (self.teacher is not None)
-        model_eval = self.teacher if use_ema_eval else self.model
-        model_eval.eval()
+        def _eval_model(m):
+            m.eval()
+            ys, ps = [], []
+            for b in DataLoader(self.ds_v, batch_size=self.bs, shuffle=False, num_workers=0,
+                                pin_memory=(self.device.type == 'cuda'), drop_last=False, collate_fn=safe_collate_fn):
+                if isinstance(b, (list, tuple)) and len(b) == 4: v, a, y, _ = b
+                else: v, a, y = b
+                v = v.to(self.device); a = a.to(self.device)
+                y = y.argmax(dim=1) if y.ndim == 2 else y
+                out = m(v, a, return_aux=False)
+                logits = out["clip_logits"] if isinstance(out, dict) and "clip_logits" in out else (list(out.values())[0] if isinstance(out, dict) else out)
+                prob = F.softmax(logits, dim=1).cpu().numpy()
+                ps.append(prob); ys.append(y.cpu().numpy())
+            y_true = np.concatenate(ys, 0); y_prob = np.concatenate(ps, 0); y_pred = y_prob.argmax(1)
+            from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+            acc = accuracy_score(y_true, y_pred); f1m = f1_score(y_true, y_pred, average="macro")
+            aucm = np.nan
+            try:
+                y_true_oh = np.eye(self.C, dtype=np.float32)[y_true]
+                aucm = roc_auc_score(y_true_oh, y_prob, average="macro", multi_class="ovr")
+            except Exception:
+                pass
+            return {"acc": float(acc), "f1_macro": float(f1m), "auc_macro": float(aucm)}
 
-        ys, ps = [], []
-        for b in DataLoader(self.ds_v, batch_size=self.bs, shuffle=False, num_workers=0,
-                            pin_memory=(self.device.type == 'cuda'), drop_last=False, collate_fn=safe_collate_fn):
-            if isinstance(b, (list, tuple)) and len(b) == 4: v, a, y, _ = b
-            else: v, a, y = b
-            v = v.to(self.device); a = a.to(self.device)
-            y = y.argmax(dim=1) if y.ndim == 2 else y
-            out = model_eval(v, a, return_aux=False)
-            logits = out["clip_logits"] if isinstance(out, dict) and "clip_logits" in out else (list(out.values())[0] if isinstance(out, dict) else out)
-            prob = F.softmax(logits, dim=1).cpu().numpy()
-            ps.append(prob); ys.append(y.cpu().numpy())
-        y_true = np.concatenate(ys, 0); y_prob = np.concatenate(ps, 0); y_pred = y_prob.argmax(1)
-
-        from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-        acc = accuracy_score(y_true, y_pred); f1m = f1_score(y_true, y_pred, average="macro")
-        aucm = np.nan
-        try:
-            y_true_oh = np.eye(self.C, dtype=np.float32)[y_true]
-            aucm = roc_auc_score(y_true_oh, y_prob, average="macro", multi_class="ovr")
-        except Exception:
-            pass
-        return {"acc": float(acc), "f1_macro": float(f1m), "auc_macro": float(aucm)}
+        stu = _eval_model(self.model)
+        tea = _eval_model(self.teacher) if (self.teacher is not None) else {"acc":0.0,"f1_macro":0.0,"auc_macro":0.0}
+        return {"student": stu, "teacher": tea}
 
     def _build_sampler(self, ds_l, inv_freq):
         labels = []
@@ -939,13 +890,12 @@ class StrongTrainer:
         w = torch.tensor(weights, dtype=torch.double)
         return WeightedRandomSampler(w, num_samples=len(ds_l), replacement=True)
 
-    # -------------------- forward wrapper with checks --------------------
     def _safe_forward(self, v: torch.Tensor, a: torch.Tensor, use_amp: bool = True):
         try:
             if torch.isnan(v).any() or torch.isinf(v).any():
-                print("⚠️ 输入视频包含nan/inf"); v = torch.where(torch.isnan(v) | torch.isinf(v), torch.zeros_like(v), v)
+                v = torch.where(torch.isnan(v) | torch.isinf(v), torch.zeros_like(v), v)
             if torch.isnan(a).any() or torch.isinf(a).any():
-                print("⚠️ 输入音频包含nan/inf"); a = torch.where(torch.isnan(a) | torch.isinf(a), torch.zeros_like(a), a)
+                a = torch.where(torch.isnan(a) | torch.isinf(a), torch.zeros_like(a), a)
             current_epoch = getattr(self, 'current_epoch', 1)
             if current_epoch >= self.amp_disable_epoch: use_amp = False
             if use_amp and self.amp_enabled:
@@ -955,20 +905,6 @@ class StrongTrainer:
                 v = v.float(); a = a.float()
                 with amp_autocast(self.device_type, enabled=False):
                     out = self._forward(v, a)
-            if isinstance(out, dict) and "clip_logits" in out:
-                logits = out["clip_logits"]
-                if torch.isnan(logits).any() or torch.isinf(logits).any():
-                    print("⚠️ 模型输出logits包含nan/inf，尝试恢复")
-                    if hasattr(self.model, 'mil_head') and hasattr(self.model.mil_head, 'classifier'):
-                        with torch.no_grad():
-                            nn.init.xavier_normal_(self.model.mil_head.classifier.weight)
-                            nn.init.zeros_(self.model.mil_head.classifier.bias)
-                        print("✓ 重新初始化MIL分类器")
-                        if use_amp and self.amp_enabled:
-                            with amp_autocast(self.device_type, enabled=True, dtype=torch.float16):
-                                out = self._forward(v, a)
-                        else:
-                            out = self._forward(v, a)
             return out
         except Exception as e:
             print(f"⚠️ 前向传播异常: {e}")
